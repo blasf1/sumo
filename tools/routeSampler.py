@@ -39,6 +39,7 @@ if 'SUMO_HOME' in os.environ:
     sys.path.append(os.path.join(os.environ['SUMO_HOME'], 'tools'))
 import sumolib  # noqa
 from sumolib.miscutils import parseTime, humanReadableTime  # noqa
+from sumolib.statistics import setPrecision  # noqa
 
 PRESERVE_INPUT_COUNT = 'input'
 
@@ -295,7 +296,8 @@ class CountData:
     def assignedProbability(self):
         if not self.isRatio:
             return None
-        return self.assignedCount / self.getSiblingCount()
+        sibCount = self.getSiblingCount()
+        return 0 if sibCount == 0 else self.assignedCount / sibCount
 
     def __repr__(self):
         return "CountData(edges=%s, count=%s, origCount=%s%s%s%s%s)\n" % (
@@ -779,6 +781,7 @@ def main(options):
     underflowSummary = sumolib.miscutils.Statistics("avg interval underflow")
     overflowSummary = sumolib.miscutils.Statistics("avg interval overflow")
     gehSummary = sumolib.miscutils.Statistics("avg interval GEH%")
+    ratioSummary = sumolib.miscutils.Statistics("avg interval ratio mismatch%")
     inputCountSummary = sumolib.miscutils.Statistics("avg interval input count")
     usedRoutesSummary = sumolib.miscutils.Statistics("avg interval written vehs")
 
@@ -794,18 +797,22 @@ def main(options):
                     underflowSummary.add(result[1][i], begin)
                     overflowSummary.add(result[2][i], begin)
                     gehSummary.add(result[3][i], begin)
-                    inputCountSummary.add(result[4][i], begin)
-                    usedRoutesSummary.add(result[5][i], begin)
+                    if result[4][i] is not None:
+                        ratioSummary.add(result[4][i], begin)
+                    inputCountSummary.add(result[5][i], begin)
+                    usedRoutesSummary.add(result[6][i], begin)
         else:
             for i, (begin, end) in enumerate(intervals):
                 intervalPrefix = "" if len(intervals) == 1 else "%s_" % int(begin)
                 intervalCount = options.totalCount[i] if options.totalCount else None
-                uFlow, oFlow, gehOK, inputCount, usedRoutes, _ = solveInterval(options, routes, begin, end,
+                uFlow, oFlow, gehOK, ratioPerc, inputCount, usedRoutes, _ = solveInterval(options, routes, begin, end,
                                                                                intervalPrefix, outf, mismatchf, rng,
                                                                                intervalCount)
                 underflowSummary.add(uFlow, begin)
                 overflowSummary.add(oFlow, begin)
                 gehSummary.add(gehOK, begin)
+                if ratioPerc is not None:
+                    ratioSummary.add(ratioPerc, begin)
                 inputCountSummary.add(inputCount, begin)
                 usedRoutesSummary.add(usedRoutes, begin)
         outf.write('</routes>\n')
@@ -820,6 +827,9 @@ def main(options):
         print(underflowSummary)
         print(overflowSummary)
         print(gehSummary)
+        if ratioSummary.count() > 0:
+            print(ratioSummary)
+
 
 
 def _sample_skewed(sampleSet, rng, probabilityMap):
@@ -843,10 +853,10 @@ def _solveIntervalMP(options, routes, interval, cpuIndex):
         local_mismatch_outf = StringIO() if options.mismatchOut else None
         intervalPrefix = "%s_" % int(begin)
         intervalCount = options.totalCount[i] if options.totalCount else None
-        uFlow, oFlow, gehOKNum, inputCount, usedRoutes, local_outf = solveInterval(
+        uFlow, oFlow, gehOKPerc, ratioPerc, inputCount, usedRoutes, local_outf = solveInterval(
             options, routes, begin, end, intervalPrefix, local_outf, local_mismatch_outf, rng, intervalCount)
 
-        output_list.append([begin, uFlow, oFlow, gehOKNum, inputCount, usedRoutes, local_outf.getvalue(),
+        output_list.append([begin, uFlow, oFlow, gehOKPerc, ratioPerc, inputCount, usedRoutes, local_outf.getvalue(),
                             local_mismatch_outf.getvalue() if options.mismatchOut else None])
     output_lst = list(zip(*output_list))
     return output_lst
@@ -1119,12 +1129,20 @@ def solveInterval(options, routes, begin, end, intervalPrefix, outf, mismatchf, 
     underflow = sumolib.miscutils.Statistics("underflow locations")
     overflow = sumolib.miscutils.Statistics("overflow locations")
     gehStats = sumolib.miscutils.Statistics("GEH")
+    ratioStats = sumolib.miscutils.Statistics("turnRatio")
     numGehOK = 0.0
+    gehOKPerc = 100
+    ratioPerc = None
     hourFraction = (end - begin) / 3600.0
     totalCount = 0
     totalOrigCount = 0
+    totalRatioCount = 0
     for cd in countData:
         if cd.isRatio:
+            aProb = setPrecision("%.2f", options.precision) % cd.assignedProbability()
+            cdID = "[%s] %s %s" % (' '.join(cd.edgeTuple), cd.origCount, aProb)
+            ratioStats.add(cd.assignedProbability() - cd.origCount, cdID)
+            totalRatioCount += cd.assignedCount
             continue
         localCount = cd.origCount - cd.count
         totalCount += localCount
@@ -1138,18 +1156,33 @@ def solveInterval(options, routes, begin, end, intervalPrefix, outf, mismatchf, 
         geh = sumolib.miscutils.geh(origHourly, localHourly)
         if geh < options.gehOk:
             numGehOK += 1
-        gehStats.add(geh, "[%s] %s %s" % (
-            ' '.join(cd.edgeTuple), int(origHourly), int(localHourly)))
+        cdID = "[%s] %s %s" % (' '.join(cd.edgeTuple), int(origHourly), int(localHourly))
+        gehStats.add(geh, cdID)
+
+    gehInfo = ""
+    ratioInfo = ""
+    if gehStats.count() > 0:
+        countPercentage = "%.2f%%" % (100 * totalCount / float(totalOrigCount)) if totalOrigCount else "-"
+        gehOKPerc = 100 * numGehOK / float(gehStats.count()) if countData else 100
+        gehOK = "%.2f%%" % gehOKPerc if countData else "-"
+        gehInfo = "total count %s (%s) at %s locations. GEH<%s for %s" % (
+                totalCount, countPercentage,
+                gehStats.count(),
+                options.gehOk, gehOK)
+
+    if ratioStats.count() > 0:
+        if gehStats.count() > 0:
+            ratioInfo = " and "
+        ratioPerc = ratioStats.avg_abs() * 100
+        ratioInfo += setPrecision("avg ratio mismatch %.2f%% at %s ratio locations (count %s)", options.precision) % (
+                ratioPerc, ratioStats.count(), totalRatioCount)
 
     outputIntervalPrefix = "" if intervalPrefix == "" else "%s: " % int(begin)
-    countPercentage = "%.2f%%" % (100 * totalCount / float(totalOrigCount)) if totalOrigCount else "-"
-    gehOKNum = 100 * numGehOK / float(len(countData)) if countData else 100
-    gehOK = "%.2f%%" % gehOKNum if countData else "-"
-    print("%sWrote %s routes (%s distinct) achieving total count %s (%s) at %s locations. GEH<%s for %s" % (
+    print("%sWrote %s routes (%s distinct) %s%s%s" % (
         outputIntervalPrefix,
         len(usedRoutes), len(set(usedRoutes)),
-        totalCount, countPercentage, len(countData),
-        options.gehOk, gehOK))
+        ("achieving " if countData else "no data"),
+        gehInfo, ratioInfo))
 
     if options.verboseHistogram:
         edgeCount = sumolib.miscutils.Statistics("route edge count", histogram=True)
@@ -1175,7 +1208,7 @@ def solveInterval(options, routes, begin, end, intervalPrefix, outf, mismatchf, 
                     cd.edgeTuple[0], cd.origCount, cd.count))
             elif len(cd.edgeTuple) == 2:
                 if cd.isRatio:
-                    deficit = ("%%.%if" % options.precision) % (cd.assignedProbability() - cd.origCount)
+                    deficit = setPrecision("%.2f",  options.precision) % (cd.assignedProbability() - cd.origCount)
                     mismatchf.write('        <edgeRelation from="%s" to="%s" measuredProbability="%s" deficit="%s" totalAssignedFromCount="%s"/>\n' % (  # noqa
                         cd.edgeTuple[0], cd.edgeTuple[1], cd.origCount, deficit, cd.getSiblingCount()))
                 else:
@@ -1186,7 +1219,7 @@ def solveInterval(options, routes, begin, end, intervalPrefix, outf, mismatchf, 
                       file=sys.stderr)
         mismatchf.write('    </interval>\n')
 
-    return sum(underflow.values), sum(overflow.values), gehOKNum, totalOrigCount, len(usedRoutes), outf
+    return sum(underflow.values), sum(overflow.values), gehOKPerc, ratioPerc, totalOrigCount, len(usedRoutes), outf
 
 
 if __name__ == "__main__":
